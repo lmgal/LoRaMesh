@@ -17,20 +17,39 @@ A multi-hop mesh networking library for LoRa radios built on top of the [arduino
 
 This library requires the [arduino-LoRa](https://github.com/sandeepmistry/arduino-LoRa) library to be installed first.
 
-### Arduino IDE
+### Using the Arduino IDE Library Manager (Coming Soon)
 
-1. Install arduino-LoRa library first (Tools > Manage Libraries > Search "LoRa" by Sandeep Mistry)
-2. Download this repository as a ZIP file
-3. In Arduino IDE: Sketch > Include Library > Add .ZIP Library
-4. Select the downloaded ZIP file
+This library is being prepared for submission to the Arduino Library Manager.
+
+### Install using ZIP Download
+
+1. First install the arduino-LoRa library:
+   - Open Arduino IDE
+   - Go to `Sketch` → `Include Library` → `Manage Libraries...`
+   - Search for "LoRa" by Sandeep Mistry and install it
+
+2. Install LoRaMesh library:
+   - Download this repository as a ZIP file:
+     - Click the green "Code" button on GitHub
+     - Select "Download ZIP"
+   - In Arduino IDE: `Sketch` → `Include Library` → `Add .ZIP Library...`
+   - Select the downloaded `LoRaMesh-main.zip` or `LoRaMesh-master.zip` file
+   - The library will be installed to your Arduino libraries folder
+
+3. Verify installation:
+   - Restart Arduino IDE
+   - Go to `File` → `Examples` → `LoRaMesh`
+   - You should see example sketches: BasicMeshNode, MeshGateway, MultiNodeDemo
 
 ### Manual Installation
 
-1. Install arduino-LoRa library
-2. Copy the LoRaMesh folder to your Arduino libraries directory:
+1. Install arduino-LoRa library (see above)
+2. Download and extract this repository
+3. Copy the entire LoRaMesh folder to your Arduino libraries directory:
    - Windows: `Documents\Arduino\libraries\`
    - macOS: `~/Documents/Arduino/libraries/`
    - Linux: `~/Arduino/libraries/`
+4. Restart Arduino IDE
 
 ## API Reference
 
