@@ -96,7 +96,7 @@ private:
     void handleDataMessage(MeshHeader& header, uint8_t* data, uint8_t len);
     void handleRouteRequest(MeshHeader& header);
     void handleRouteReply(MeshHeader& header);
-    void handleRouteFailure(MeshHeader& header);
+    void handleRouteFailure(MeshHeader& header, uint8_t* data, uint8_t len);
     
     bool startRouteDiscovery(uint8_t destination);
     void updateRoutingTable(uint8_t destination, uint8_t nextHop, uint8_t hopCount);

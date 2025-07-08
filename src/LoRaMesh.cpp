@@ -219,7 +219,7 @@ bool LoRaMesh::receivePacket() {
             handleRouteReply(header);
             break;
         case MESSAGE_TYPE_ROUTE_FAILURE:
-            handleRouteFailure(header);
+            handleRouteFailure(header, data, dataLen);
             break;
     }
     
@@ -307,9 +307,9 @@ void LoRaMesh::handleRouteReply(MeshHeader& header) {
     }
 }
 
-void LoRaMesh::handleRouteFailure(MeshHeader& header) {
-    if (header.destination == _address && header.dataLen > 0) {
-        clearRoute(header.data[0]);
+void LoRaMesh::handleRouteFailure(MeshHeader& header, uint8_t* data, uint8_t len) {
+    if (header.destination == _address && len > 0) {
+        clearRoute(data[0]);
     }
 }
 
