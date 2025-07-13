@@ -10,12 +10,17 @@
 #define LORAMESH_ROUTE_TIMEOUT 30000
 #define LORAMESH_ROUTE_DISCOVERY_TIMEOUT 5000
 #define LORAMESH_BROADCAST_ADDRESS 0xFF
+#define LORAMESH_ACK_TIMEOUT 300
+#define LORAMESH_MAX_ACK_RETRIES 3
+#define LORAMESH_MESSAGE_BUFFER_SIZE 5
+#define LORAMESH_PENDING_QUEUE_SIZE 3
 
 enum MessageType {
     MESSAGE_TYPE_DATA = 0x00,
     MESSAGE_TYPE_ROUTE_REQUEST = 0x01,
     MESSAGE_TYPE_ROUTE_REPLY = 0x02,
-    MESSAGE_TYPE_ROUTE_FAILURE = 0x03
+    MESSAGE_TYPE_ROUTE_FAILURE = 0x03,
+    MESSAGE_TYPE_ACK = 0x04
 };
 
 enum RouteState {
@@ -75,13 +80,36 @@ private:
     
     RoutingEntry _routingTable[LORAMESH_ROUTING_TABLE_SIZE];
     
-    struct {
+    // Message buffering - circular buffer for received messages
+    struct MessageBuffer {
         MeshHeader header;
         uint8_t data[LORAMESH_MAX_MESSAGE_LEN];
         uint8_t dataLen;
         bool valid;
         unsigned long timestamp;
-    } _rxBuffer;
+    };
+    MessageBuffer _rxBuffer[LORAMESH_MESSAGE_BUFFER_SIZE];
+    uint8_t _rxBufferHead;
+    uint8_t _rxBufferTail;
+    
+    // ACK tracking
+    struct AckTracker {
+        uint8_t destination;
+        uint8_t messageId;
+        bool ackReceived;
+        unsigned long timestamp;
+    } _ackTracker;
+    
+    // Pending messages waiting for route discovery
+    struct PendingMessage {
+        uint8_t destination;
+        uint8_t data[LORAMESH_MAX_MESSAGE_LEN];
+        uint8_t dataLen;
+        uint8_t messageId;
+        bool valid;
+        unsigned long timestamp;
+    };
+    PendingMessage _pendingQueue[LORAMESH_PENDING_QUEUE_SIZE];
     
     struct {
         uint8_t destination;
@@ -91,12 +119,21 @@ private:
     } _routeDiscovery;
     
     bool sendPacket(MeshHeader& header, const uint8_t* data, uint8_t len);
+    bool sendPacketWithAck(MeshHeader& header, const uint8_t* data, uint8_t len);
     bool receivePacket();
+    void sendAck(uint8_t destination, uint8_t messageId);
     
     void handleDataMessage(MeshHeader& header, uint8_t* data, uint8_t len);
     void handleRouteRequest(MeshHeader& header);
     void handleRouteReply(MeshHeader& header);
     void handleRouteFailure(MeshHeader& header, uint8_t* data, uint8_t len);
+    void handleAck(MeshHeader& header);
+    
+    void extractRoutesFromPath(MeshHeader& header, bool isRequest);
+    void addToMessageBuffer(MeshHeader& header, uint8_t* data, uint8_t len);
+    bool getFromMessageBuffer(uint8_t* buf, uint8_t* len, uint8_t* source, uint8_t* dest, uint8_t* id);
+    void addToPendingQueue(uint8_t destination, const uint8_t* data, uint8_t len, uint8_t messageId);
+    void processPendingMessages();
     
     bool startRouteDiscovery(uint8_t destination);
     void updateRoutingTable(uint8_t destination, uint8_t nextHop, uint8_t hopCount);

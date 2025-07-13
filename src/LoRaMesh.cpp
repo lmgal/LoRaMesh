@@ -5,8 +5,22 @@ LoRaMesh::LoRaMesh() {
     _messageId = 0;
     _retries = 3;
     _retryTimeout = 200;
-    _rxBuffer.valid = false;
     _routeDiscovery.active = false;
+    
+    // Initialize message buffer
+    _rxBufferHead = 0;
+    _rxBufferTail = 0;
+    for (int i = 0; i < LORAMESH_MESSAGE_BUFFER_SIZE; i++) {
+        _rxBuffer[i].valid = false;
+    }
+    
+    // Initialize pending queue
+    for (int i = 0; i < LORAMESH_PENDING_QUEUE_SIZE; i++) {
+        _pendingQueue[i].valid = false;
+    }
+    
+    // Initialize ACK tracker
+    _ackTracker.ackReceived = false;
     
     for (int i = 0; i < LORAMESH_ROUTING_TABLE_SIZE; i++) {
         _routingTable[i].state = ROUTE_STATE_INVALID;
@@ -49,28 +63,6 @@ bool LoRaMesh::sendToWait(uint8_t destination, const uint8_t* data, uint8_t len,
     
     cleanupRoutingTable();
     
-    RoutingEntry* route = findRoute(destination);
-    
-    if (!route || route->state != ROUTE_STATE_VALID) {
-        if (!startRouteDiscovery(destination)) {
-            return false;
-        }
-        
-        unsigned long discoveryStart = millis();
-        while (millis() - discoveryStart < LORAMESH_ROUTE_DISCOVERY_TIMEOUT) {
-            process();
-            route = findRoute(destination);
-            if (route && route->state == ROUTE_STATE_VALID) {
-                break;
-            }
-            delay(10);
-        }
-        
-        if (!route || route->state != ROUTE_STATE_VALID) {
-            return false;
-        }
-    }
-    
     MeshHeader header;
     header.destination = destination;
     header.source = _address;
@@ -79,50 +71,71 @@ bool LoRaMesh::sendToWait(uint8_t destination, const uint8_t* data, uint8_t len,
     header.hopCount = 0;
     header.visitedCount = 0;
     
-    for (uint8_t retry = 0; retry < _retries; retry++) {
-        if (sendPacket(header, data, len)) {
-            return true;
+    RoutingEntry* route = findRoute(destination);
+    
+    if (!route || route->state != ROUTE_STATE_VALID) {
+        // No route - add to pending queue and start discovery
+        addToPendingQueue(destination, data, len, header.messageId);
+        
+        if (!startRouteDiscovery(destination)) {
+            return false;
         }
-        delay(_retryTimeout);
+        
+        // Wait for route discovery
+        unsigned long discoveryStart = millis();
+        while (millis() - discoveryStart < LORAMESH_ROUTE_DISCOVERY_TIMEOUT) {
+            process();
+            route = findRoute(destination);
+            if (route && route->state == ROUTE_STATE_VALID) {
+                // Route found - message will be sent by processPendingMessages
+                return true;
+            }
+            
+            // Check if route discovery has been cleared (failed)
+            if (!_routeDiscovery.active || 
+                (_routeDiscovery.destination == destination && 
+                 route && route->state == ROUTE_STATE_INVALID)) {
+                // Route discovery failed
+                return false;
+            }
+            
+            delay(10);
+        }
+        
+        // Timeout - clear the active discovery
+        if (_routeDiscovery.active && _routeDiscovery.destination == destination) {
+            _routeDiscovery.active = false;
+        }
+        
+        return false;
     }
     
-    clearRoute(destination);
-    return false;
+    // We have a route - send immediately
+    return sendPacketWithAck(header, data, len);
 }
 
 bool LoRaMesh::recvFromAck(uint8_t* buf, uint8_t* len, uint8_t* source, uint8_t* dest, uint8_t* id, uint8_t* flags) {
     process();
     
-    if (!_rxBuffer.valid) {
-        return false;
-    }
-    
-    if (_rxBuffer.header.messageType != MESSAGE_TYPE_DATA) {
-        _rxBuffer.valid = false;
-        return false;
-    }
-    
-    if (len) {
-        *len = min(*len, _rxBuffer.dataLen);
-        memcpy(buf, _rxBuffer.data, *len);
-    }
-    
-    if (source) *source = _rxBuffer.header.source;
-    if (dest) *dest = _rxBuffer.header.destination;
-    if (id) *id = _rxBuffer.header.messageId;
-    
-    _rxBuffer.valid = false;
-    return true;
+    return getFromMessageBuffer(buf, len, source, dest, id);
 }
 
 bool LoRaMesh::available() {
     process();
-    return _rxBuffer.valid && _rxBuffer.header.messageType == MESSAGE_TYPE_DATA;
+    // Check if there are any valid data messages in the buffer
+    uint8_t temp = _rxBufferTail;
+    while (temp != _rxBufferHead) {
+        if (_rxBuffer[temp].valid && _rxBuffer[temp].header.messageType == MESSAGE_TYPE_DATA) {
+            return true;
+        }
+        temp = (temp + 1) % LORAMESH_MESSAGE_BUFFER_SIZE;
+    }
+    return false;
 }
 
 void LoRaMesh::process() {
-    if (receivePacket()) {
-    }
+    receivePacket();
+    processPendingMessages();
 }
 
 bool LoRaMesh::sendPacket(MeshHeader& header, const uint8_t* data, uint8_t len) {
@@ -167,6 +180,65 @@ bool LoRaMesh::sendPacket(MeshHeader& header, const uint8_t* data, uint8_t len) 
     return LoRa.endPacket();
 }
 
+bool LoRaMesh::sendPacketWithAck(MeshHeader& header, const uint8_t* data, uint8_t len) {
+    // Messages that don't need ACK
+    if (header.destination == LORAMESH_BROADCAST_ADDRESS || 
+        header.messageType == MESSAGE_TYPE_ROUTE_REQUEST ||
+        header.messageType == MESSAGE_TYPE_ACK) {
+        return sendPacket(header, data, len);
+    }
+    
+    // Find the next hop
+    RoutingEntry* route = findRoute(header.destination);
+    if (!route || route->state != ROUTE_STATE_VALID) {
+        return false;
+    }
+    
+    uint8_t nextHop = (header.destination == route->nextHop) ? header.destination : route->nextHop;
+    
+    // Try sending with ACK
+    for (uint8_t retry = 0; retry <= LORAMESH_MAX_ACK_RETRIES; retry++) {
+        // Setup ACK tracker
+        _ackTracker.destination = nextHop;
+        _ackTracker.messageId = header.messageId;
+        _ackTracker.ackReceived = false;
+        _ackTracker.timestamp = millis();
+        
+        // Send the packet
+        if (!sendPacket(header, data, len)) {
+            continue;
+        }
+        
+        // Wait for ACK
+        unsigned long ackStart = millis();
+        while (millis() - ackStart < LORAMESH_ACK_TIMEOUT) {
+            if (receivePacket()) {
+                if (_ackTracker.ackReceived) {
+                    return true;
+                }
+            }
+            delay(10);
+        }
+    }
+    
+    // Failed to get ACK - notify route failure if this was a forwarded message
+    if (header.source != _address && header.messageType == MESSAGE_TYPE_DATA) {
+        MeshHeader failureHeader;
+        failureHeader.destination = header.source;
+        failureHeader.source = _address;
+        failureHeader.messageId = getNextMessageId();
+        failureHeader.messageType = MESSAGE_TYPE_ROUTE_FAILURE;
+        failureHeader.hopCount = 0;
+        failureHeader.visitedCount = 0;
+        
+        uint8_t failureData[1] = {header.destination};
+        sendPacket(failureHeader, failureData, 1);
+    }
+    
+    clearRoute(header.destination);
+    return false;
+}
+
 bool LoRaMesh::receivePacket() {
     int packetSize = LoRa.parsePacket();
     if (packetSize == 0) return false;
@@ -204,8 +276,13 @@ bool LoRaMesh::receivePacket() {
     
     if (header.hopCount > LORAMESH_MAX_HOPS) return false;
     
-    if (header.source != _address && header.messageType != MESSAGE_TYPE_ROUTE_REQUEST) {
-        updateRoutingTable(header.source, header.source, 1);
+    // Learn direct route to immediate neighbor (the actual sender)
+    if (header.source != _address && nextHop != LORAMESH_BROADCAST_ADDRESS && 
+        nextHop != _address) {
+        // For messages from immediate neighbors, next hop is the source
+        if (header.hopCount == 1 || header.source == nextHop) {
+            updateRoutingTable(header.source, header.source, 1);
+        }
     }
     
     switch (header.messageType) {
@@ -221,36 +298,31 @@ bool LoRaMesh::receivePacket() {
         case MESSAGE_TYPE_ROUTE_FAILURE:
             handleRouteFailure(header, data, dataLen);
             break;
+        case MESSAGE_TYPE_ACK:
+            handleAck(header);
+            break;
     }
     
     return true;
 }
 
 void LoRaMesh::handleDataMessage(MeshHeader& header, uint8_t* data, uint8_t len) {
+    // First, send ACK if this message is for us or we're the next hop
+    if (header.destination == _address || 
+        (header.destination != LORAMESH_BROADCAST_ADDRESS && header.hopCount > 0)) {
+        sendAck(header.source, header.messageId);
+    }
+    
     if (header.destination == _address || header.destination == LORAMESH_BROADCAST_ADDRESS) {
-        _rxBuffer.header = header;
-        _rxBuffer.dataLen = len;
-        memcpy(_rxBuffer.data, data, len);
-        _rxBuffer.valid = true;
-        _rxBuffer.timestamp = millis();
+        // Store in message buffer
+        addToMessageBuffer(header, data, len);
     }
     
     if (header.destination != _address && header.destination != LORAMESH_BROADCAST_ADDRESS) {
-        RoutingEntry* route = findRoute(header.destination);
-        if (route && route->state == ROUTE_STATE_VALID) {
-            header.hopCount++;
-            sendPacket(header, data, len);
-        } else {
-            MeshHeader failureHeader;
-            failureHeader.destination = header.source;
-            failureHeader.source = _address;
-            failureHeader.messageId = getNextMessageId();
-            failureHeader.messageType = MESSAGE_TYPE_ROUTE_FAILURE;
-            failureHeader.hopCount = 0;
-            failureHeader.visitedCount = 0;
-            
-            uint8_t failureData[1] = {header.destination};
-            sendPacket(failureHeader, failureData, 1);
+        // Forward the message
+        header.hopCount++;
+        if (!sendPacketWithAck(header, data, len)) {
+            // Already handled in sendPacketWithAck
         }
     }
 }
@@ -260,20 +332,27 @@ void LoRaMesh::handleRouteRequest(MeshHeader& header) {
         return;
     }
     
+    // Learn routes from the path in the route request
+    extractRoutesFromPath(header, true);
+    
     if (header.destination == _address) {
+        // We are the destination - send a route reply
         MeshHeader replyHeader;
         replyHeader.destination = header.source;
         replyHeader.source = _address;
         replyHeader.messageId = header.messageId;
         replyHeader.messageType = MESSAGE_TYPE_ROUTE_REPLY;
         replyHeader.hopCount = 0;
-        replyHeader.visitedCount = header.visitedCount;
+        replyHeader.visitedCount = header.visitedCount + 1; // Include ourselves
         
+        // Copy visited nodes and add ourselves
         memcpy(replyHeader.visitedNodes, header.visitedNodes, header.visitedCount);
+        replyHeader.visitedNodes[header.visitedCount] = _address;
         
         uint8_t emptyData[1] = {0};
         sendPacket(replyHeader, emptyData, 0);
     } else {
+        // Forward the request
         header.hopCount++;
         addVisitedNode(header, _address);
         
@@ -283,39 +362,56 @@ void LoRaMesh::handleRouteRequest(MeshHeader& header) {
 }
 
 void LoRaMesh::handleRouteReply(MeshHeader& header) {
+    // Learn routes from the path in the route reply
+    extractRoutesFromPath(header, false);
+    
     if (header.destination == _address) {
+        // This reply is for us
         if (_routeDiscovery.active && 
             _routeDiscovery.messageId == header.messageId) {
-            
-            uint8_t hopsToDest = 1;
-            for (uint8_t i = header.visitedCount - 1; i > 0; i--) {
-                if (header.visitedNodes[i] == _address) {
-                    break;
-                }
-                hopsToDest++;
-            }
-            
-            updateRoutingTable(header.source, header.source, hopsToDest);
             _routeDiscovery.active = false;
         }
     } else {
+        // Forward the reply
         RoutingEntry* route = findRoute(header.destination);
         if (route && route->state == ROUTE_STATE_VALID) {
             uint8_t emptyData[1] = {0};
-            sendPacket(header, emptyData, 0);
+            sendPacketWithAck(header, emptyData, 0);
         }
     }
 }
 
 void LoRaMesh::handleRouteFailure(MeshHeader& header, uint8_t* data, uint8_t len) {
+    // Send ACK for route failure message
+    sendAck(header.source, header.messageId);
+    
     if (header.destination == _address && len > 0) {
+        // Clear the failed route
         clearRoute(data[0]);
+    } else if (header.destination != _address) {
+        // Forward the route failure message
+        sendPacketWithAck(header, data, len);
     }
 }
 
 bool LoRaMesh::startRouteDiscovery(uint8_t destination) {
+    // Check if there's an active route discovery
     if (_routeDiscovery.active) {
-        return false;
+        // If the current discovery has timed out, clear it
+        if (millis() - _routeDiscovery.startTime > LORAMESH_ROUTE_DISCOVERY_TIMEOUT) {
+            _routeDiscovery.active = false;
+            // Clear the route state if it's still discovering
+            RoutingEntry* route = findRoute(_routeDiscovery.destination);
+            if (route && route->state == ROUTE_STATE_DISCOVERING) {
+                route->state = ROUTE_STATE_INVALID;
+            }
+        } else if (_routeDiscovery.destination == destination) {
+            // Already discovering this destination
+            return true;
+        } else {
+            // Different destination requested while another is active
+            return false;
+        }
     }
     
     MeshHeader header;
@@ -409,6 +505,17 @@ void LoRaMesh::cleanupRoutingTable() {
             _routingTable[i].state = ROUTE_STATE_INVALID;
         }
     }
+    
+    // Also check for timed out route discovery
+    if (_routeDiscovery.active && 
+        (now - _routeDiscovery.startTime) > LORAMESH_ROUTE_DISCOVERY_TIMEOUT) {
+        _routeDiscovery.active = false;
+        // Clear the route state if it's still discovering
+        RoutingEntry* route = findRoute(_routeDiscovery.destination);
+        if (route && route->state == ROUTE_STATE_DISCOVERING) {
+            route->state = ROUTE_STATE_INVALID;
+        }
+    }
 }
 
 bool LoRaMesh::isNodeVisited(MeshHeader& header, uint8_t node) {
@@ -471,4 +578,184 @@ void LoRaMesh::setRetries(uint8_t retries) {
 
 void LoRaMesh::setRetryTimeout(uint16_t timeout) {
     _retryTimeout = timeout;
+}
+
+void LoRaMesh::sendAck(uint8_t destination, uint8_t messageId) {
+    MeshHeader ackHeader;
+    ackHeader.destination = destination;
+    ackHeader.source = _address;
+    ackHeader.messageId = messageId;
+    ackHeader.messageType = MESSAGE_TYPE_ACK;
+    ackHeader.hopCount = 0;
+    ackHeader.visitedCount = 0;
+    
+    uint8_t emptyData[1] = {0};
+    sendPacket(ackHeader, emptyData, 0);
+}
+
+void LoRaMesh::handleAck(MeshHeader& header) {
+    if (_ackTracker.destination == header.source && 
+        _ackTracker.messageId == header.messageId) {
+        _ackTracker.ackReceived = true;
+    }
+}
+
+void LoRaMesh::addToMessageBuffer(MeshHeader& header, uint8_t* data, uint8_t len) {
+    // Add to circular buffer
+    _rxBuffer[_rxBufferHead].header = header;
+    _rxBuffer[_rxBufferHead].dataLen = len;
+    memcpy(_rxBuffer[_rxBufferHead].data, data, len);
+    _rxBuffer[_rxBufferHead].valid = true;
+    _rxBuffer[_rxBufferHead].timestamp = millis();
+    
+    _rxBufferHead = (_rxBufferHead + 1) % LORAMESH_MESSAGE_BUFFER_SIZE;
+    
+    // If buffer is full, advance tail
+    if (_rxBufferHead == _rxBufferTail) {
+        _rxBufferTail = (_rxBufferTail + 1) % LORAMESH_MESSAGE_BUFFER_SIZE;
+    }
+}
+
+bool LoRaMesh::getFromMessageBuffer(uint8_t* buf, uint8_t* len, uint8_t* source, uint8_t* dest, uint8_t* id) {
+    // Find the oldest valid DATA message
+    while (_rxBufferTail != _rxBufferHead) {
+        if (_rxBuffer[_rxBufferTail].valid && 
+            _rxBuffer[_rxBufferTail].header.messageType == MESSAGE_TYPE_DATA) {
+            
+            if (len) {
+                *len = min(*len, _rxBuffer[_rxBufferTail].dataLen);
+                memcpy(buf, _rxBuffer[_rxBufferTail].data, *len);
+            }
+            
+            if (source) *source = _rxBuffer[_rxBufferTail].header.source;
+            if (dest) *dest = _rxBuffer[_rxBufferTail].header.destination;
+            if (id) *id = _rxBuffer[_rxBufferTail].header.messageId;
+            
+            _rxBuffer[_rxBufferTail].valid = false;
+            _rxBufferTail = (_rxBufferTail + 1) % LORAMESH_MESSAGE_BUFFER_SIZE;
+            return true;
+        }
+        _rxBufferTail = (_rxBufferTail + 1) % LORAMESH_MESSAGE_BUFFER_SIZE;
+    }
+    return false;
+}
+
+void LoRaMesh::addToPendingQueue(uint8_t destination, const uint8_t* data, uint8_t len, uint8_t messageId) {
+    for (int i = 0; i < LORAMESH_PENDING_QUEUE_SIZE; i++) {
+        if (!_pendingQueue[i].valid) {
+            _pendingQueue[i].destination = destination;
+            _pendingQueue[i].dataLen = len;
+            memcpy(_pendingQueue[i].data, data, len);
+            _pendingQueue[i].messageId = messageId;
+            _pendingQueue[i].valid = true;
+            _pendingQueue[i].timestamp = millis();
+            break;
+        }
+    }
+}
+
+void LoRaMesh::processPendingMessages() {
+    unsigned long now = millis();
+    
+    for (int i = 0; i < LORAMESH_PENDING_QUEUE_SIZE; i++) {
+        if (_pendingQueue[i].valid) {
+            // Check for timeout
+            if (now - _pendingQueue[i].timestamp > LORAMESH_ROUTE_DISCOVERY_TIMEOUT * 3) {
+                // Give up after 3x discovery timeout
+                _pendingQueue[i].valid = false;
+                continue;
+            }
+            
+            // Check if we now have a route
+            RoutingEntry* route = findRoute(_pendingQueue[i].destination);
+            if (route && route->state == ROUTE_STATE_VALID) {
+                MeshHeader header;
+                header.destination = _pendingQueue[i].destination;
+                header.source = _address;
+                header.messageId = _pendingQueue[i].messageId;
+                header.messageType = MESSAGE_TYPE_DATA;
+                header.hopCount = 0;
+                header.visitedCount = 0;
+                
+                sendPacketWithAck(header, _pendingQueue[i].data, _pendingQueue[i].dataLen);
+                _pendingQueue[i].valid = false;
+            } else if (!route || route->state == ROUTE_STATE_INVALID) {
+                // No route or invalid route - retry discovery if not active
+                if (!_routeDiscovery.active || 
+                    (_routeDiscovery.destination != _pendingQueue[i].destination &&
+                     now - _routeDiscovery.startTime > LORAMESH_ROUTE_DISCOVERY_TIMEOUT)) {
+                    startRouteDiscovery(_pendingQueue[i].destination);
+                }
+            }
+        }
+    }
+}
+
+void LoRaMesh::extractRoutesFromPath(MeshHeader& header, bool isRequest) {
+    // For route requests: learn reverse routes (back to source)
+    // For route replies: learn forward routes (to all nodes in path)
+    
+    if (header.visitedCount == 0) return;
+    
+    if (isRequest) {
+        // Route request: learn routes back to source through visited nodes
+        uint8_t hopCount = 1;
+        
+        // Find our position in the visited nodes (if we're already there)
+        int ourPosition = -1;
+        for (int i = 0; i < header.visitedCount; i++) {
+            if (header.visitedNodes[i] == _address) {
+                ourPosition = i;
+                break;
+            }
+        }
+        
+        // If we're not in the list yet, we're at the end
+        if (ourPosition == -1) {
+            ourPosition = header.visitedCount;
+        }
+        
+        // Learn route to source
+        if (ourPosition > 0) {
+            uint8_t nextHop = header.visitedNodes[ourPosition - 1];
+            updateRoutingTable(header.source, nextHop, ourPosition);
+        } else {
+            // We're the first hop from source
+            updateRoutingTable(header.source, header.source, 1);
+        }
+        
+        // Learn routes to all intermediate nodes
+        for (int i = 0; i < ourPosition; i++) {
+            if (i > 0) {
+                updateRoutingTable(header.visitedNodes[i], header.visitedNodes[ourPosition - 1], ourPosition - i);
+            }
+        }
+    } else {
+        // Route reply: learn routes forward through the path
+        // Find our position in the path
+        int ourPosition = -1;
+        for (int i = 0; i < header.visitedCount; i++) {
+            if (header.visitedNodes[i] == _address) {
+                ourPosition = i;
+                break;
+            }
+        }
+        
+        if (ourPosition >= 0) {
+            // Learn routes to all nodes after us in the path
+            for (int i = ourPosition + 1; i < header.visitedCount; i++) {
+                uint8_t nextHop = (ourPosition + 1 < header.visitedCount) ? 
+                                  header.visitedNodes[ourPosition + 1] : header.source;
+                updateRoutingTable(header.visitedNodes[i], nextHop, i - ourPosition);
+            }
+            
+            // Learn route to the reply source (original destination)
+            if (ourPosition + 1 < header.visitedCount) {
+                updateRoutingTable(header.source, header.visitedNodes[ourPosition + 1], 
+                                 header.visitedCount - ourPosition);
+            } else {
+                updateRoutingTable(header.source, header.source, 1);
+            }
+        }
+    }
 }
