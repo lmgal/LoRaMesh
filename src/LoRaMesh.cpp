@@ -5,22 +5,22 @@ LoRaMesh::LoRaMesh() {
     _messageId = 0;
     _retries = 3;
     _retryTimeout = 200;
-    _routeDiscovery.active = false;
+    _routeDiscovery.active = 0;
     
     // Initialize message buffer
     _rxBufferHead = 0;
     _rxBufferTail = 0;
     for (int i = 0; i < LORAMESH_MESSAGE_BUFFER_SIZE; i++) {
-        _rxBuffer[i].valid = false;
+        _rxBuffer[i].valid = 0;
     }
     
     // Initialize pending queue
     for (int i = 0; i < LORAMESH_PENDING_QUEUE_SIZE; i++) {
-        _pendingQueue[i].valid = false;
+        _pendingQueue[i].valid = 0;
     }
     
     // Initialize ACK tracker
-    _ackTracker.ackReceived = false;
+    _ackTracker.ackReceived = 0;
     
     for (int i = 0; i < LORAMESH_ROUTING_TABLE_SIZE; i++) {
         _routingTable[i].state = ROUTE_STATE_INVALID;
@@ -104,7 +104,7 @@ bool LoRaMesh::sendToWait(uint8_t destination, const uint8_t* data, uint8_t len,
         
         // Timeout - clear the active discovery
         if (_routeDiscovery.active && _routeDiscovery.destination == destination) {
-            _routeDiscovery.active = false;
+            _routeDiscovery.active = 0;
         }
         
         return false;
@@ -201,8 +201,8 @@ bool LoRaMesh::sendPacketWithAck(MeshHeader& header, const uint8_t* data, uint8_
         // Setup ACK tracker
         _ackTracker.destination = nextHop;
         _ackTracker.messageId = header.messageId;
-        _ackTracker.ackReceived = false;
-        _ackTracker.timestamp = millis();
+        _ackTracker.ackReceived = 0;
+        _ackTracker.timestampAge = 0;
         
         // Send the packet
         if (!sendPacket(header, data, len)) {
@@ -369,7 +369,7 @@ void LoRaMesh::handleRouteReply(MeshHeader& header) {
         // This reply is for us
         if (_routeDiscovery.active && 
             _routeDiscovery.messageId == header.messageId) {
-            _routeDiscovery.active = false;
+            _routeDiscovery.active = 0;
         }
     } else {
         // Forward the reply
@@ -398,8 +398,8 @@ bool LoRaMesh::startRouteDiscovery(uint8_t destination) {
     // Check if there's an active route discovery
     if (_routeDiscovery.active) {
         // If the current discovery has timed out, clear it
-        if (millis() - _routeDiscovery.startTime > LORAMESH_ROUTE_DISCOVERY_TIMEOUT) {
-            _routeDiscovery.active = false;
+        if (isAgeExpired(_routeDiscovery.startTimeAge, LORAMESH_ROUTE_DISCOVERY_TIMEOUT / 1000)) {
+            _routeDiscovery.active = 0;
             // Clear the route state if it's still discovering
             RoutingEntry* route = findRoute(_routeDiscovery.destination);
             if (route && route->state == ROUTE_STATE_DISCOVERING) {
@@ -423,9 +423,9 @@ bool LoRaMesh::startRouteDiscovery(uint8_t destination) {
     header.visitedCount = 0;
     
     _routeDiscovery.destination = destination;
-    _routeDiscovery.startTime = millis();
+    _routeDiscovery.startTimeAge = 0;
     _routeDiscovery.messageId = header.messageId;
-    _routeDiscovery.active = true;
+    _routeDiscovery.active = 1;
     
     RoutingEntry* route = findRoute(destination);
     if (!route) {
@@ -440,7 +440,7 @@ bool LoRaMesh::startRouteDiscovery(uint8_t destination) {
     if (route) {
         route->destination = destination;
         route->state = ROUTE_STATE_DISCOVERING;
-        route->lastSeen = millis();
+        route->lastSeenAge = 0;
     }
     
     uint8_t emptyData[1] = {0};
@@ -459,11 +459,11 @@ void LoRaMesh::updateRoutingTable(uint8_t destination, uint8_t nextHop, uint8_t 
         }
         
         if (!route) {
-            unsigned long oldestTime = millis();
+            uint16_t oldestAge = 0;
             int oldestIndex = 0;
             for (int i = 0; i < LORAMESH_ROUTING_TABLE_SIZE; i++) {
-                if (_routingTable[i].lastSeen < oldestTime) {
-                    oldestTime = _routingTable[i].lastSeen;
+                if (_routingTable[i].lastSeenAge > oldestAge) {
+                    oldestAge = _routingTable[i].lastSeenAge;
                     oldestIndex = i;
                 }
             }
@@ -476,7 +476,7 @@ void LoRaMesh::updateRoutingTable(uint8_t destination, uint8_t nextHop, uint8_t 
         route->nextHop = nextHop;
         route->hopCount = hopCount;
         route->state = ROUTE_STATE_VALID;
-        route->lastSeen = millis();
+        route->lastSeenAge = 0;
     }
 }
 
@@ -498,23 +498,31 @@ void LoRaMesh::clearRoute(uint8_t destination) {
 }
 
 void LoRaMesh::cleanupRoutingTable() {
-    unsigned long now = millis();
     for (int i = 0; i < LORAMESH_ROUTING_TABLE_SIZE; i++) {
         if (_routingTable[i].state == ROUTE_STATE_VALID &&
-            (now - _routingTable[i].lastSeen) > LORAMESH_ROUTE_TIMEOUT) {
+            isAgeExpired(_routingTable[i].lastSeenAge, LORAMESH_ROUTE_TIMEOUT / 1000)) {
             _routingTable[i].state = ROUTE_STATE_INVALID;
+        }
+        // Update age for all entries
+        if (_routingTable[i].state != ROUTE_STATE_INVALID) {
+            _routingTable[i].lastSeenAge = min(_routingTable[i].lastSeenAge + 1, 65535);
         }
     }
     
     // Also check for timed out route discovery
     if (_routeDiscovery.active && 
-        (now - _routeDiscovery.startTime) > LORAMESH_ROUTE_DISCOVERY_TIMEOUT) {
-        _routeDiscovery.active = false;
+        isAgeExpired(_routeDiscovery.startTimeAge, LORAMESH_ROUTE_DISCOVERY_TIMEOUT / 1000)) {
+        _routeDiscovery.active = 0;
         // Clear the route state if it's still discovering
         RoutingEntry* route = findRoute(_routeDiscovery.destination);
         if (route && route->state == ROUTE_STATE_DISCOVERING) {
             route->state = ROUTE_STATE_INVALID;
         }
+    }
+    
+    // Update route discovery age
+    if (_routeDiscovery.active) {
+        _routeDiscovery.startTimeAge = min(_routeDiscovery.startTimeAge + 1, 65535);
     }
 }
 
@@ -596,7 +604,7 @@ void LoRaMesh::sendAck(uint8_t destination, uint8_t messageId) {
 void LoRaMesh::handleAck(MeshHeader& header) {
     if (_ackTracker.destination == header.source && 
         _ackTracker.messageId == header.messageId) {
-        _ackTracker.ackReceived = true;
+        _ackTracker.ackReceived = 1;
     }
 }
 
@@ -605,8 +613,8 @@ void LoRaMesh::addToMessageBuffer(MeshHeader& header, uint8_t* data, uint8_t len
     _rxBuffer[_rxBufferHead].header = header;
     _rxBuffer[_rxBufferHead].dataLen = len;
     memcpy(_rxBuffer[_rxBufferHead].data, data, len);
-    _rxBuffer[_rxBufferHead].valid = true;
-    _rxBuffer[_rxBufferHead].timestamp = millis();
+    _rxBuffer[_rxBufferHead].valid = 1;
+    _rxBuffer[_rxBufferHead].timestampAge = 0;
     
     _rxBufferHead = (_rxBufferHead + 1) % LORAMESH_MESSAGE_BUFFER_SIZE;
     
@@ -631,7 +639,7 @@ bool LoRaMesh::getFromMessageBuffer(uint8_t* buf, uint8_t* len, uint8_t* source,
             if (dest) *dest = _rxBuffer[_rxBufferTail].header.destination;
             if (id) *id = _rxBuffer[_rxBufferTail].header.messageId;
             
-            _rxBuffer[_rxBufferTail].valid = false;
+            _rxBuffer[_rxBufferTail].valid = 0;
             _rxBufferTail = (_rxBufferTail + 1) % LORAMESH_MESSAGE_BUFFER_SIZE;
             return true;
         }
@@ -647,24 +655,26 @@ void LoRaMesh::addToPendingQueue(uint8_t destination, const uint8_t* data, uint8
             _pendingQueue[i].dataLen = len;
             memcpy(_pendingQueue[i].data, data, len);
             _pendingQueue[i].messageId = messageId;
-            _pendingQueue[i].valid = true;
-            _pendingQueue[i].timestamp = millis();
+            _pendingQueue[i].valid = 1;
+            _pendingQueue[i].timestampAge = 0;
             break;
         }
     }
 }
 
 void LoRaMesh::processPendingMessages() {
-    unsigned long now = millis();
     
     for (int i = 0; i < LORAMESH_PENDING_QUEUE_SIZE; i++) {
         if (_pendingQueue[i].valid) {
             // Check for timeout
-            if (now - _pendingQueue[i].timestamp > LORAMESH_ROUTE_DISCOVERY_TIMEOUT * 3) {
+            if (isAgeExpired(_pendingQueue[i].timestampAge, (LORAMESH_ROUTE_DISCOVERY_TIMEOUT * 3) / 1000)) {
                 // Give up after 3x discovery timeout
-                _pendingQueue[i].valid = false;
+                _pendingQueue[i].valid = 0;
                 continue;
             }
+            
+            // Update age
+            _pendingQueue[i].timestampAge = min(_pendingQueue[i].timestampAge + 1, 65535);
             
             // Check if we now have a route
             RoutingEntry* route = findRoute(_pendingQueue[i].destination);
@@ -678,12 +688,12 @@ void LoRaMesh::processPendingMessages() {
                 header.visitedCount = 0;
                 
                 sendPacketWithAck(header, _pendingQueue[i].data, _pendingQueue[i].dataLen);
-                _pendingQueue[i].valid = false;
+                _pendingQueue[i].valid = 0;
             } else if (!route || route->state == ROUTE_STATE_INVALID) {
                 // No route or invalid route - retry discovery if not active
                 if (!_routeDiscovery.active || 
                     (_routeDiscovery.destination != _pendingQueue[i].destination &&
-                     now - _routeDiscovery.startTime > LORAMESH_ROUTE_DISCOVERY_TIMEOUT)) {
+                     isAgeExpired(_routeDiscovery.startTimeAge, LORAMESH_ROUTE_DISCOVERY_TIMEOUT / 1000))) {
                     startRouteDiscovery(_pendingQueue[i].destination);
                 }
             }
@@ -758,4 +768,28 @@ void LoRaMesh::extractRoutesFromPath(MeshHeader& header, bool isRequest) {
             }
         }
     }
+}
+
+// Helper functions for age-based timestamp system
+uint16_t LoRaMesh::getAgeFromTime(unsigned long timestamp) {
+    unsigned long currentTime = millis();
+    if (currentTime >= timestamp) {
+        return min((currentTime - timestamp) / 1000, 65535UL);
+    }
+    // Handle rollover case
+    return min(((0xFFFFFFFF - timestamp) + currentTime) / 1000, 65535UL);
+}
+
+unsigned long LoRaMesh::getTimeFromAge(uint16_t age) {
+    unsigned long currentTime = millis();
+    unsigned long ageMs = (unsigned long)age * 1000;
+    if (currentTime >= ageMs) {
+        return currentTime - ageMs;
+    }
+    // Handle rollover case
+    return (0xFFFFFFFF - ageMs) + currentTime;
+}
+
+bool LoRaMesh::isAgeExpired(uint16_t age, uint16_t timeoutSeconds) {
+    return age >= timeoutSeconds;
 }

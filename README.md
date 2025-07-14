@@ -10,6 +10,9 @@ A multi-hop mesh networking library for LoRa radios built on top of the [arduino
 - **Broadcast Support**: Send messages to all nodes in the network
 - **Simple API**: Easy-to-use interface similar to arduino-LoRa
 - **Spresense Compatible**: Designed for platforms not supported by RadioHead
+- **Memory Optimized**: Configurable memory usage with 36-68% reduction options
+- **ACK System**: Reliable message delivery with automatic acknowledgments
+- **Message Buffering**: Circular buffer for handling multiple incoming messages
 
 ## Installation
 
@@ -112,6 +115,58 @@ Print current routing table to Serial.
 #### `getRoutingTable()`
 Get pointer to routing table array.
 
+## Memory Optimization
+
+The library offers configurable memory usage to accommodate different hardware constraints:
+
+### Memory Profiles
+
+Define one of these macros **before** including LoRaMesh.h:
+
+```cpp
+// For memory-constrained devices (e.g., Arduino Uno)
+#define LORAMESH_MEMORY_CONSTRAINED
+
+// For high-performance applications
+#define LORAMESH_HIGH_CAPACITY
+
+// Default: Standard mode (balanced performance/memory)
+```
+
+### Memory Usage Comparison
+
+| Mode | Memory Usage | Reduction | Buffer Sizes |
+|------|-------------|-----------|--------------|
+| **Memory-Constrained** | ~732 bytes | 68% | 2 RX, 1 pending, 5 routes |
+| **Standard** (default) | ~1,438 bytes | 36% | 3 RX, 2 pending, 8 routes |
+| **High-Capacity** | ~2,912 bytes | - | 8 RX, 5 pending, 15 routes |
+
+### Custom Configuration
+
+For fine-tuned control, define buffer sizes before including the library:
+
+```cpp
+#define LORAMESH_MESSAGE_BUFFER_SIZE 4
+#define LORAMESH_PENDING_QUEUE_SIZE 3
+#define LORAMESH_ROUTING_TABLE_SIZE 12
+#define LORAMESH_MAX_HOPS 6
+#include <LoRaMesh.h>
+```
+
+### Memory-Constrained Example
+
+```cpp
+#include <SPI.h>
+#define LORAMESH_MEMORY_CONSTRAINED  // Enable minimal memory mode
+#include <LoRaMesh.h>
+
+LoRaMesh mesh;  // Uses only ~732 bytes
+
+void setup() {
+    mesh.begin(915E6, 0x01);
+}
+```
+
 ## How It Works
 
 The mesh network uses a reactive routing protocol:
@@ -132,20 +187,27 @@ Messages include a header with:
 
 ## Constants
 
+### Fixed Protocol Constants
 - `LORAMESH_MAX_MESSAGE_LEN`: Maximum message length (251 bytes)
-- `LORAMESH_ROUTING_TABLE_SIZE`: Number of routes stored (10)
-- `LORAMESH_MAX_HOPS`: Maximum hop count (10)
 - `LORAMESH_BROADCAST_ADDRESS`: Broadcast address (0xFF)
 - `LORAMESH_ROUTE_TIMEOUT`: Route expiry time (30 seconds)
 - `LORAMESH_ROUTE_DISCOVERY_TIMEOUT`: Route discovery timeout (5 seconds)
+- `LORAMESH_ACK_TIMEOUT`: ACK wait timeout (300ms)
+- `LORAMESH_MAX_ACK_RETRIES`: Maximum retry attempts (3)
+
+### Configurable Buffer Sizes
+- `LORAMESH_MESSAGE_BUFFER_SIZE`: RX message buffer size (default: 3)
+- `LORAMESH_PENDING_QUEUE_SIZE`: Pending message queue size (default: 2)
+- `LORAMESH_ROUTING_TABLE_SIZE`: Number of routes stored (default: 8)
+- `LORAMESH_MAX_HOPS`: Maximum hop count (default: 8)
 
 ## Limitations
 
-- No message queueing - one message at a time
-- Limited routing table size (10 entries)
+- Limited routing table size (configurable, default: 8 entries)
 - No encryption or authentication
 - Basic routing algorithm may not find optimal paths
 - Route discovery adds latency to first message
+- Memory-constrained mode has reduced buffering capacity
 
 ## License
 
